@@ -1,0 +1,75 @@
+WITH SNAPSHOT_TMP AS ( SELECT /*+ materialize */ MIN(SNAP_ID) SNAP
+                        FROM DBA_HIST_SNAPSHOT SN
+                        WHERE SN.BEGIN_INTERVAL_TIME > SYSDATE - &DAYS_BACK
+                        ORDER BY 1
+),SEG_STAT_TMP AS ( SELECT /*+ materialize */ A.OBJ#,
+                           ROUND(SUM(SPACE_USED_DELTA) / 1024 / 1024,
+                                 0) AS SPACE_GROWTH_MB1,
+                           ROUND(SUM(SPACE_ALLOCATED_DELTA) / 1024 / 1024,
+                                 0) AS SPACE_GROWTH_LOB_MB1
+                                                              FROM DBA_HIST_SEG_STAT A
+                                         WHERE SNAP_ID >= ( SELECT SNAP
+                                                                 FROM SNAPSHOT_TMP
+                                                              ) AND
+                                               A.DATAOBJ# = ( SELECT MAX(Y.DATAOBJ#)
+                                                                               FROM DBA_HIST_SEG_STAT Y
+                                                               WHERE Y.OBJ# = A.OBJ#
+                                                            )
+                     GROUP BY A.OBJ#
+),OBJ_TMP AS ( SELECT /*+ materialize */ B.OWNER,
+                      (
+                                  CASE
+                                      WHEN B.SUBOBJECT_NAME IS NULL THEN B.OBJECT_NAME
+                                      ELSE B.SUBOBJECT_NAME
+                                  END
+                              )   OBJ_NAME,
+                      CASE
+                                  WHEN B.OBJECT_TYPE IN ( 'TABLE','TABLE PARTITION','TABLE SUBPARTITION' ) THEN B.OBJECT_NAME
+                                  WHEN B.OBJECT_TYPE IN ( 'INDEX','INDEX PARTITION','INDEX SUBPARTITION' ) THEN ( SELECT I.TABLE_NAME
+                                                                                                                                                                                                        FROM
+                                                                                                                                                                                                        DBA_INDEXES
+                                                                                                                                                                                                        I
+                                                                                                                       WHERE I.OWNER = B.OWNER
+                                                                                                                       AND
+                                                                                                                             I.INDEX_NAME = B.OBJECT_NAME
+                                                                                                                    )
+                                  WHEN B.OBJECT_TYPE = 'LOB'           THEN ( SELECT L.TABLE_NAME
+                                                                                                            FROM DBA_LOBS L
+                                                                         WHERE L.OWNER = B.OWNER AND
+                                                                               L.SEGMENT_NAME = B.OBJECT_NAME
+                                                                      )
+                                  WHEN B.OBJECT_TYPE = 'LOB PARTITION' THEN ( SELECT MAX(P.TABLE_NAME)
+                                                                                                                                FROM DBA_LOB_PARTITIONS
+                                                                                                                                P
+                                                                                   WHERE P.TABLE_OWNER = B.OWNER AND
+                                                                                         P.LOB_NAME = B.OBJECT_NAME
+                                                                                )
+                                  ELSE B.OBJECT_NAME
+                      END PARENT_OBJ_NAME,
+                      B.OBJECT_TYPE,
+                      B.OBJECT_ID,
+                      A.SPACE_GROWTH_MB1,
+                      SPACE_GROWTH_LOB_MB1
+                                FROM DBA_OBJECTS  B,
+                                     SEG_STAT_TMP A
+                WHERE B.OBJECT_ID = A.OBJ#
+)
+SELECT *
+  FROM ( SELECT OWNER,
+                OBJ_NAME,
+                PARENT_OBJ_NAME,
+                OBJECT_TYPE,
+                SUM(
+                    CASE
+                        WHEN OBJECT_TYPE IN('LOB','LOB PARTITION') THEN SPACE_GROWTH_LOB_MB1
+                        ELSE SPACE_GROWTH_MB1
+                    END
+                ) AS SPACE_GROWTH_MB
+                FROM OBJ_TMP
+        GROUP BY OWNER,
+                 OBJ_NAME,
+                 PARENT_OBJ_NAME,
+                 OBJECT_TYPE
+       )
+ WHERE SPACE_GROWTH_MB >= 10
+ ORDER BY SPACE_GROWTH_MB DESC NULLS LAST;
